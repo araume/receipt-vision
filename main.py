@@ -2,15 +2,21 @@ import os
 import re
 import csv
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytesseract
 from PIL import Image
 import cv2
 import numpy as np
+from pytesseract import Output
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import hashlib
+import json
+import urllib.request
+import urllib.error
+import email.utils
 import webbrowser
 
 from pathlib import Path
@@ -25,6 +31,11 @@ def _try_bundle_tesseract():
 		pytesseract.pytesseract.tesseract_cmd = str(tesseract_path)
 
 _try_bundle_tesseract()
+
+# Fallback to default system install if bundle not found
+_default_tess_path = 'C:/Program Files/Tesseract-OCR/tesseract.exe'
+if 'TESSDATA_PREFIX' not in os.environ and os.path.exists(_default_tess_path):
+    pytesseract.pytesseract.tesseract_cmd = _default_tess_path
 
 
 IMAGE_EXTENSIONS = {
@@ -54,6 +65,351 @@ def preprocess_image(image_path: str) -> Image.Image:
     image_clean = cv2.morphologyEx(image_bin, cv2.MORPH_OPEN, kernel)
     pil_img = Image.fromarray(image_clean)
     return pil_img
+
+
+# -----------
+# OCR helpers
+# -----------
+
+def _rotate_to_orientation(image_bgr: np.ndarray) -> np.ndarray:
+    try:
+        osd = pytesseract.image_to_osd(image_bgr)
+        m = re.search(r"Rotate:\s*(\d+)", osd)
+        if not m:
+            return image_bgr
+        deg = int(m.group(1)) % 360
+        if deg == 90:
+            return cv2.rotate(image_bgr, cv2.ROTATE_90_CLOCKWISE)
+        if deg == 180:
+            return cv2.rotate(image_bgr, cv2.ROTATE_180)
+        if deg == 270:
+            return cv2.rotate(image_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    except Exception:
+        pass
+    return image_bgr
+
+
+def _scale_for_ocr(image_bgr: np.ndarray) -> np.ndarray:
+    h, w = image_bgr.shape[:2]
+    target_max_dim = 1600
+    max_dim = max(h, w)
+    if max_dim >= target_max_dim:
+        return image_bgr
+    scale = target_max_dim / float(max_dim)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    return cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+
+def _clahe(gray: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    return clahe.apply(gray)
+
+
+def _preprocess_variants(image_bgr: np.ndarray) -> list[Image.Image]:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    gray_blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray_clahe = _clahe(gray_blur)
+
+    variants = []
+
+    # Adaptive Gaussian (existing style)
+    v1 = cv2.adaptiveThreshold(gray_clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 31, 10)
+    variants.append(Image.fromarray(v1))
+    variants.append(Image.fromarray(cv2.bitwise_not(v1)))
+
+    # OTSU
+    _, v2 = cv2.threshold(gray_clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(Image.fromarray(v2))
+    variants.append(Image.fromarray(cv2.bitwise_not(v2)))
+
+    # Adaptive mean
+    v3 = cv2.adaptiveThreshold(gray_clahe, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY, 31, 10)
+    variants.append(Image.fromarray(v3))
+    variants.append(Image.fromarray(cv2.bitwise_not(v3)))
+
+    # Plain CLAHE gray (no threshold)
+    variants.append(Image.fromarray(gray_clahe))
+
+    return variants
+
+
+def _ocr_union_text(variants: list[Image.Image]) -> str:
+    configs = [
+        "--oem 3 --psm 6 -l eng",
+        "--oem 3 --psm 4 -l eng",
+        "--oem 3 --psm 11 -l eng",
+    ]
+    texts = []
+    for img in variants:
+        for cfg in configs:
+            try:
+                texts.append(pytesseract.image_to_string(img, config=cfg))
+            except Exception:
+                continue
+    return "\n".join(t for t in texts if t)
+
+
+def _tesseract_data(image_bgr: np.ndarray, config: str = "--oem 3 --psm 6 -l eng") -> dict:
+    try:
+        return pytesseract.image_to_data(image_bgr, config=config, output_type=Output.DICT)
+    except Exception:
+        return {"text": []}
+
+
+def _group_words_by_line(data: dict) -> list[dict]:
+    if not data or not data.get("text"):
+        return []
+    n = len(data["text"])
+    lines = {}
+    for i in range(n):
+        try:
+            if int(data.get("conf", ["-1"][i])[i]) < -1:  # guard
+                pass
+        except Exception:
+            pass
+        key = (data.get("block_num", [0])[i], data.get("par_num", [0])[i], data.get("line_num", [0])[i])
+        if key not in lines:
+            lines[key] = {
+                "left": [], "top": [], "right": [], "bottom": [], "words": []
+            }
+        text = data["text"][i] or ""
+        if text.strip() == "":
+            continue
+        l = data["left"][i]; t = data["top"][i]
+        w = data["width"][i]; h = data["height"][i]
+        lines[key]["left"].append(l); lines[key]["top"].append(t)
+        lines[key]["right"].append(l + w); lines[key]["bottom"].append(t + h)
+        lines[key]["words"].append(text)
+    merged = []
+    for key, rec in lines.items():
+        if not rec["words"]:
+            continue
+        left = min(rec["left"]); top = min(rec["top"]) 
+        right = max(rec["right"]); bottom = max(rec["bottom"])
+        merged.append({
+            "bbox": (left, top, right, bottom),
+            "text": " ".join(rec["words"]).strip()
+        })
+    return merged
+
+
+def _crop_expand(image_bgr: np.ndarray, bbox: tuple[int, int, int, int], expand: float = 0.25) -> np.ndarray:
+    h, w = image_bgr.shape[:2]
+    x1, y1, x2, y2 = bbox
+    dx = int((x2 - x1) * expand)
+    dy = int((y2 - y1) * expand)
+    nx1 = max(0, x1 - dx)
+    ny1 = max(0, y1 - dy)
+    nx2 = min(w, x2 + dx)
+    ny2 = min(h, y2 + dy)
+    return image_bgr[ny1:ny2, nx1:nx2]
+
+
+def _ocr_roi_digits(image_bgr: np.ndarray) -> str:
+    roi_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    roi_gray = _clahe(roi_gray)
+    _, th = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.resize(th, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    pil = Image.fromarray(th)
+    cfg = "--oem 3 --psm 6 -l eng -c tessedit_char_whitelist=+0123456789()"
+    try:
+        return pytesseract.image_to_string(pil, config=cfg)
+    except Exception:
+        return ""
+
+
+def _ocr_roi_code(image_bgr: np.ndarray) -> str:
+    roi_gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    roi_gray = _clahe(roi_gray)
+    _, th = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.resize(th, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    pil = Image.fromarray(th)
+    cfg = "--oem 3 --psm 7 -l eng -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+    try:
+        return pytesseract.image_to_string(pil, config=cfg)
+    except Exception:
+        return ""
+
+
+def _extract_phone_from_layout(image_bgr: np.ndarray) -> str:
+    data = _tesseract_data(image_bgr)
+    lines = _group_words_by_line(data)
+    # First pass: keyword lines
+    for line in lines:
+        txt = line["text"]
+        if _PHONE_KEYWORD_PATTERN.search(txt) and not _REF_LINE_PATTERN.search(txt):
+            roi = _crop_expand(image_bgr, line["bbox"], 0.4)
+            raw = _ocr_roi_digits(roi)
+            m = _PHONE_PH_PATTERN.search(raw) or _PHONE_GENERIC_PATTERN.search(raw)
+            if m:
+                return _format_ph_phone(m.group(0))
+    # Second pass: any line with 09 or +63 9
+    for line in lines:
+        txt = line["text"]
+        if "+63" in txt or re.search(r"\b0?9\d{2}\b", txt):
+            roi = _crop_expand(image_bgr, line["bbox"], 0.3)
+            raw = _ocr_roi_digits(roi)
+            m = _PHONE_PH_PATTERN.search(raw) or _PHONE_GENERIC_PATTERN.search(raw)
+            if m:
+                return _format_ph_phone(m.group(0))
+    return ""
+
+
+def _extract_total_from_layout(image_bgr: np.ndarray) -> str:
+    data = _tesseract_data(image_bgr)
+    lines = _group_words_by_line(data)
+    for line in lines:
+        txt = line["text"]
+        if _AMOUNT_KEYWORDS.search(txt):
+            roi = _crop_expand(image_bgr, line["bbox"], 0.5)
+            # OCR with money-friendly whitelist
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            roi_gray = _clahe(roi_gray)
+            _, th = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            th = cv2.resize(th, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+            pil = Image.fromarray(th)
+            cfg = "--oem 3 --psm 6 -l eng -c tessedit_char_whitelist=$€£₱0123456789., "
+            try:
+                raw = pytesseract.image_to_string(pil, config=cfg)
+            except Exception:
+                raw = ""
+            m = _MONEY_PATTERN.search(raw)
+            if m:
+                return m.group(1).strip()
+    return ""
+
+
+def _extract_total_global(image_bgr: np.ndarray) -> str:
+    # Scan the whole image with money whitelist across variants
+    variants = _preprocess_variants(image_bgr)
+    cfg = "--oem 3 --psm 6 -l eng -c tessedit_char_whitelist=$€£₱PpHh0123456789., "
+    texts = []
+    for img in variants:
+        try:
+            texts.append(pytesseract.image_to_string(img, config=cfg))
+        except Exception:
+            continue
+    text = "\n".join(texts)
+    candidates = [m.group(1).strip() for m in _MONEY_PATTERN.finditer(text)]
+    if not candidates:
+        return ""
+    def parse_amount(val: str) -> float:
+        s = val.replace("$", "").replace("€", "").replace("£", "").replace("₱", "").replace("P", "").replace("p", "")
+        s = s.strip().replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return -1.0
+    return max(candidates, key=parse_amount)
+
+
+def _extract_reference_from_layout(image_bgr: np.ndarray) -> str:
+    data = _tesseract_data(image_bgr)
+    lines = _group_words_by_line(data)
+    for idx, line in enumerate(lines):
+        txt = line["text"]
+        if _REF_LINE_PATTERN.search(txt):
+            # Try same line
+            roi1 = _crop_expand(image_bgr, line["bbox"], 0.5)
+            raw1 = _ocr_roi_code(roi1).upper()
+            for m in _REF_CODE_PATTERN.finditer(raw1):
+                cand = m.group(0)
+                if not re.fullmatch(r"63?9\d{9}", _digits_only(cand)):
+                    return cand
+            # Try next line if available
+            if idx + 1 < len(lines):
+                roi2 = _crop_expand(image_bgr, lines[idx + 1]["bbox"], 0.4)
+                raw2 = _ocr_roi_code(roi2).upper()
+                for m in _REF_CODE_PATTERN.finditer(raw2):
+                    cand = m.group(0)
+                    if not re.fullmatch(r"63?9\d{9}", _digits_only(cand)):
+                        return cand
+    return ""
+
+
+def extract_all_fields(image_path: str, mode: str = "Balanced") -> dict:
+    image_bgr = cv2.imread(image_path)
+    if image_bgr is None:
+        raise ValueError(f"Unable to read image: {image_path}")
+    # Mode controls: orientation, scaling, variants, layout fallbacks
+    do_rotate = True
+    do_scale = True
+    use_layout_fallbacks = True
+    psm_configs = ["--oem 3 --psm 6 -l eng", "--oem 3 --psm 4 -l eng", "--oem 3 --psm 11 -l eng"]
+    if mode == "Fast":
+        do_rotate = False
+        do_scale = False
+        use_layout_fallbacks = False
+        psm_configs = ["--oem 3 --psm 6 -l eng"]
+    elif mode == "Balanced":
+        do_rotate = True
+        do_scale = True
+        use_layout_fallbacks = True
+        psm_configs = ["--oem 3 --psm 6 -l eng", "--oem 3 --psm 4 -l eng"]
+    elif mode == "Max accuracy":
+        do_rotate = True
+        do_scale = True
+        use_layout_fallbacks = True
+        psm_configs = ["--oem 3 --psm 6 -l eng", "--oem 3 --psm 4 -l eng", "--oem 3 --psm 11 -l eng"]
+
+    if do_rotate:
+        image_bgr = _rotate_to_orientation(image_bgr)
+    if do_scale:
+        image_bgr = _scale_for_ocr(image_bgr)
+
+    variants = _preprocess_variants(image_bgr)
+    # Build OCR text using mode-specific PSM configs
+    texts = []
+    for img in variants:
+        for cfg in psm_configs:
+            try:
+                texts.append(pytesseract.image_to_string(img, config=cfg))
+            except Exception:
+                continue
+    union_text = "\n".join(t for t in texts if t)
+
+    # First pass from union text
+    reference = extract_reference_number(union_text)
+    phone = extract_phone(union_text, forbidden_codes={reference} if reference else None)
+    total = extract_total_amount(union_text)
+    date = extract_date(union_text)
+
+    # Fallbacks via layout-driven ROIs
+    if use_layout_fallbacks and not phone:
+        try:
+            phone = _extract_phone_from_layout(image_bgr)
+        except Exception:
+            pass
+    if use_layout_fallbacks and not reference:
+        try:
+            reference = _extract_reference_from_layout(image_bgr)
+        except Exception:
+            pass
+    if use_layout_fallbacks and not total:
+        try:
+            total = _extract_total_from_layout(image_bgr)
+        except Exception:
+            pass
+    if use_layout_fallbacks and not total:
+        try:
+            total = _extract_total_global(image_bgr)
+        except Exception:
+            pass
+
+    # Final phone normalization and exclusion
+    if reference:
+        phone = extract_phone(phone or union_text, forbidden_codes={reference}) or phone
+
+    return {
+        "date": date,
+        "phone": phone,
+        "total": total,
+        "reference": reference,
+        "ocr_text": union_text,
+    }
 
 
 def ocr_image(pil_image: Image.Image) -> str:
@@ -293,6 +649,7 @@ class OCRApp:
         self.folder_path_var = tk.StringVar()
         self.progress_var = tk.IntVar(value=0)
         self.status_var = tk.StringVar(value="Select a folder to begin.")
+        self.mode_var = tk.StringVar(value="Balanced")
 
         self.results = []  # list of dicts: {filename, date, phone, total, reference}
         self._scan_thread = None
@@ -309,10 +666,30 @@ class OCRApp:
         ttk.Label(top_frame, text="Folder:").pack(side=tk.LEFT)
         entry = ttk.Entry(top_frame, textvariable=self.folder_path_var)
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(5, 5))
-        ttk.Button(top_frame, text="Browse", command=self._on_browse).pack(side=tk.LEFT)
-        ttk.Button(top_frame, text="Start Scan", command=self._on_start_scan).pack(side=tk.LEFT, padx=(5, 0))
+        self.browse_btn = ttk.Button(top_frame, text="Browse", command=self._on_browse)
+        self.browse_btn.pack(side=tk.LEFT)
+        self.start_btn = ttk.Button(top_frame, text="Start Scan", command=self._on_start_scan)
+        self.start_btn.pack(side=tk.LEFT, padx=(5, 0))
+        self.cancel_btn = ttk.Button(top_frame, text="Cancel", command=self._on_cancel_scan)
+        try:
+            self.cancel_btn.state(["disabled"])  # disabled initially
+        except Exception:
+            pass
+        self.cancel_btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        ttk.Label(top_frame, text="Mode:").pack(side=tk.LEFT, padx=(10, 0))
+        self.mode_combo = ttk.Combobox(
+            top_frame,
+            textvariable=self.mode_var,
+            width=14,
+            state="readonly",
+            values=["Fast", "Balanced", "Max accuracy"],
+        )
+        self.mode_combo.pack(side=tk.LEFT, padx=(5, 0))
+
         ttk.Button(top_frame, text="Export CSV", command=self._on_export).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Button(top_frame, text="Rename Files", command=self._on_rename_files).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(top_frame, text="View OCR Text", command=self._on_view_ocr_text).pack(side=tk.LEFT, padx=(5, 0))
 
         # Progress bar and status
         prog_frame = ttk.Frame(self.root)
@@ -362,6 +739,9 @@ class OCRApp:
         self._stop_requested = False
         self.current_folder = folder
 
+        # Set UI states for scanning
+        self._set_scan_ui_state(True)
+
         self._scan_thread = threading.Thread(target=self._scan_folder, args=(folder,), daemon=True)
         self._scan_thread.start()
 
@@ -371,22 +751,21 @@ class OCRApp:
         total = len(files)
         if total == 0:
             self._set_status("No image files found in the selected folder.")
+            self._set_scan_ui_state(False)
             return
         for idx, filename in enumerate(files, start=1):
             if self._stop_requested:
                 break
             filepath = os.path.join(folder, filename)
             try:
-                pil_img = preprocess_image(filepath)
-                text = ocr_image(pil_img)
-                reference = extract_reference_number(text)
-                phone = extract_phone(text, forbidden_codes={reference} if reference else None)
+                fields = extract_all_fields(filepath, mode=self.mode_var.get())
                 info = {
                     "filename": filename,
-                    "date": extract_date(text),
-                    "phone": phone,
-                    "total": extract_total_amount(text),
-                    "reference": reference,
+                    "date": fields.get("date", ""),
+                    "phone": fields.get("phone", ""),
+                    "total": fields.get("total", ""),
+                    "reference": fields.get("reference", ""),
+                    "ocr_text": fields.get("ocr_text", ""),
                 }
             except Exception as e:
                 info = {
@@ -395,6 +774,7 @@ class OCRApp:
                     "phone": "",
                     "total": "",
                     "reference": "",
+                    "ocr_text": "",
                 }
             self.results.append(info)
             self._append_row(info)
@@ -402,7 +782,63 @@ class OCRApp:
             self._set_progress(progress_pct)
             self._set_status(f"Processed {idx}/{total} files")
 
-        self._set_status("Scan completed.")
+        if self._stop_requested:
+            self._set_status("Scan cancelled.")
+        else:
+            self._set_status("Scan completed.")
+        self._set_scan_ui_state(False)
+
+    def _set_scan_ui_state(self, scanning: bool) -> None:
+        def _apply():
+            try:
+                if scanning:
+                    self.cancel_btn.state(["!disabled"])
+                    self.start_btn.state(["disabled"])
+                    self.browse_btn.state(["disabled"])
+                    self.mode_combo.state(["disabled"])
+                else:
+                    self.cancel_btn.state(["disabled"])
+                    self.start_btn.state(["!disabled"])
+                    self.browse_btn.state(["!disabled"])
+                    self.mode_combo.state(["readonly"])  # selectable
+            except Exception:
+                pass
+        self.root.after(0, _apply)
+
+    def _on_cancel_scan(self) -> None:
+        self._stop_requested = True
+        self._set_status("Cancelling...")
+        try:
+            self.cancel_btn.state(["disabled"])
+        except Exception:
+            pass
+
+    def _on_view_ocr_text(self) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("No Selection", "Please select a row in the table first.")
+            return
+        item_id = sel[0]
+        values = self.tree.item(item_id, "values")
+        if not values:
+            messagebox.showinfo("No Data", "Selected row has no data.")
+            return
+        filename = values[0]
+        match = None
+        for info in self.results:
+            if info.get("filename") == filename:
+                match = info
+                break
+        ocr_text = (match or {}).get("ocr_text", "")
+        top = tk.Toplevel(self.root)
+        top.title(f"OCR Text - {filename}")
+        top.geometry("800x600")
+        frm = ttk.Frame(top)
+        frm.pack(fill=tk.BOTH, expand=True)
+        txt = tk.Text(frm, wrap=tk.WORD)
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert("1.0", ocr_text)
+        txt.configure(state=tk.DISABLED)
 
     # -----------------
     # Renaming helpers
@@ -480,6 +916,14 @@ class OCRApp:
             ref_raw = info.get("reference", "")
             total_raw = info.get("total", "")
             mdy = self._parse_date_to_mdy_yy(date_raw)
+            if not mdy:
+                # Fallback: use file's modified time
+                try:
+                    mtime = os.path.getmtime(os.path.join(folder, orig_name))
+                    dt = datetime.fromtimestamp(mtime)
+                    mdy = f"{dt.month}.{dt.day}.{str(dt.year)[-2:]}"
+                except Exception:
+                    mdy = ""
             ref = self._sanitize_reference(ref_raw)
             total = self._sanitize_amount(total_raw)
             if not (orig_name and mdy and ref and total):
@@ -563,12 +1007,13 @@ class OCRApp:
             return
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
+                fieldnames = ["filename", "date", "phone", "total", "reference"]
                 writer = csv.DictWriter(
-                    f, fieldnames=["filename", "date", "phone", "total", "reference"]
+                    f, fieldnames=fieldnames, extrasaction='ignore'
                 )
                 writer.writeheader()
                 for row in self.results:
-                    writer.writerow(row)
+                    writer.writerow({k: row.get(k, "") for k in fieldnames})
             messagebox.showinfo("Export Complete", f"Saved: {path}")
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
@@ -582,6 +1027,250 @@ class OCRApp:
 
 def main() -> None:
     root = tk.Tk()
+    root.withdraw()
+
+    # Activation policy
+    ACTIVATION_ENFORCE_DATE = datetime(2025, 9, 20).date()  # Start enforcing on this date (UTC)
+    ACTIVATION_HASH = "73427e0ec2d74565ee01c6d90da35d85ed091d4b40df8e6cb3984816904b9709"  # 64-char lowercase hex; set this value directly
+
+    def _sha256_hex(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    # Persistent state helpers (prevent clock rollback bypass)
+    def _storage_path() -> str:
+        base = os.getenv("APPDATA") or os.getcwd()
+        return os.path.join(base, "receipt_vision_state.json")
+
+    def _load_last_seen_utc() -> datetime | None:
+        try:
+            with open(_storage_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            val = data.get("last_seen_utc", "")
+            if not val:
+                return None
+            # Stored as ISO without tz; interpret as UTC
+            return datetime.fromisoformat(val)
+        except Exception:
+            return None
+
+    def _save_last_seen_utc(dt_utc: datetime) -> None:
+        try:
+            payload = {"last_seen_utc": dt_utc.replace(microsecond=0).isoformat()}
+            with open(_storage_path(), "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception:
+            pass
+
+    # Persistent activation/block state
+    def _load_state() -> dict:
+        try:
+            with open(_storage_path(), "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_state(state: dict) -> None:
+        try:
+            with open(_storage_path(), "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    def _is_activated() -> bool:
+        try:
+            state = _load_state()
+            return state.get("activated_hash") == ACTIVATION_HASH
+        except Exception:
+            return False
+
+    def _mark_activated(at_utc: datetime | None = None) -> None:
+        try:
+            state = _load_state()
+            state["activated_hash"] = ACTIVATION_HASH
+            if at_utc is None:
+                try:
+                    at_utc = datetime.utcnow()
+                except Exception:
+                    at_utc = None
+            if at_utc is not None:
+                state["activated_at_utc"] = at_utc.replace(microsecond=0).isoformat()
+            _save_state(state)
+        except Exception:
+            pass
+
+    def _is_blocked() -> bool:
+        try:
+            state = _load_state()
+            return bool(state.get("blocked", False))
+        except Exception:
+            return False
+
+    def _mark_blocked(at_utc: datetime | None = None) -> None:
+        try:
+            state = _load_state()
+            state["blocked"] = True
+            if at_utc is None:
+                try:
+                    at_utc = datetime.utcnow()
+                except Exception:
+                    at_utc = None
+            if at_utc is not None:
+                state["blocked_at_utc"] = at_utc.replace(microsecond=0).isoformat()
+            _save_state(state)
+        except Exception:
+            pass
+
+    def _online_utc_now() -> datetime | None:
+        # Try to get reliable UTC time from HTTP Date header
+        for url in ("https://www.google.com", "https://www.microsoft.com", "https://cloudflare.com"):
+            try:
+                req = urllib.request.Request(url, method="HEAD")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    date_hdr = resp.headers.get("Date")
+                if not date_hdr:
+                    continue
+                dt = email.utils.parsedate_to_datetime(date_hdr)
+                if dt is None:
+                    continue
+                # Normalize to naive UTC
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            except Exception:
+                continue
+        return None
+
+    def _observed_utc_today() -> datetime.date:
+        last_seen = _load_last_seen_utc()
+        try:
+            local_now = datetime.utcnow()
+        except Exception:
+            local_now = None
+        online_now = _online_utc_now()
+
+        candidates = [d for d in (last_seen, local_now, online_now) if d is not None]
+        if not candidates:
+            # Fallback to enforcement date to avoid accidental bypass
+            return ACTIVATION_ENFORCE_DATE
+        best = max(candidates)
+        # Persist the max to prevent rollback bypass next run
+        try:
+            _save_last_seen_utc(best)
+        except Exception:
+            pass
+        return best.date()
+
+    def _is_enforcement_active() -> bool:
+        if _is_activated():
+            return False
+        today_utc = _observed_utc_today()
+        return today_utc >= ACTIVATION_ENFORCE_DATE
+
+    def _prompt_activation() -> bool:
+        if not ACTIVATION_HASH:
+            messagebox.showerror(
+                "Activation Required",
+                "Activation is required but the activation hash is not configured. Please contact the developer.",
+            )
+            return False
+
+        attempts_total = 5
+        attempts_left = attempts_total
+        result = {"ok": False}
+
+        top = tk.Toplevel(root)
+        top.title("Activation Required")
+        top.resizable(False, False)
+        top.grab_set()
+
+        container = ttk.Frame(top, padding=(12, 12, 12, 12))
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="Activation is required to continue.").pack(anchor=tk.W)
+        warn = ttk.Label(
+            container,
+            text=(
+                "Warning: You have 5 attempts. Using all attempts will permanently disable "
+                "this application on this device."
+            ),
+            foreground="#d93025",
+            wraplength=420,
+            justify=tk.LEFT,
+        )
+        warn.pack(anchor=tk.W, pady=(6, 6))
+
+        attempts_var = tk.StringVar(value=f"Attempts remaining: {attempts_left}")
+        ttk.Label(container, textvariable=attempts_var).pack(anchor=tk.W)
+
+        ttk.Label(container, text="Activation code:").pack(anchor=tk.W, pady=(8, 2))
+        code_entry = ttk.Entry(container, show="*")
+        code_entry.pack(fill=tk.X)
+        code_entry.focus_set()
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X, pady=(10, 0))
+
+        def on_submit() -> None:
+            nonlocal attempts_left
+            code = code_entry.get().strip()
+            if not code:
+                return
+            if _sha256_hex(code) == ACTIVATION_HASH.strip().lower():
+                try:
+                    _mark_activated()
+                except Exception:
+                    pass
+                result["ok"] = True
+                top.destroy()
+                return
+            attempts_left -= 1
+            if attempts_left <= 0:
+                try:
+                    _mark_blocked()
+                except Exception:
+                    pass
+                messagebox.showerror(
+                    "Activation Failed",
+                    "Activation attempts exceeded. The application will now close permanently on this device.",
+                    parent=top,
+                )
+                result["ok"] = False
+                top.destroy()
+                return
+            attempts_var.set(f"Attempts remaining: {attempts_left}")
+            messagebox.showwarning(
+                "Invalid Code",
+                f"Activation failed. {attempts_left} attempt(s) left.",
+                parent=top,
+            )
+            code_entry.delete(0, tk.END)
+            code_entry.focus_set()
+
+        def on_cancel() -> None:
+            result["ok"] = False
+            top.destroy()
+
+        ttk.Button(buttons, text="Activate", command=on_submit).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+
+        top.bind("<Return>", lambda e: on_submit())
+        top.protocol("WM_DELETE_WINDOW", on_cancel)
+        root.wait_window(top)
+        return bool(result.get("ok"))
+
+    # Hard block if previously exhausted attempts
+    if _is_blocked():
+        messagebox.showerror("Application Blocked", "This application has been permanently disabled due to failed activation attempts.")
+        root.destroy()
+        return
+
+    if _is_enforcement_active():
+        ok = _prompt_activation()
+        if not ok:
+            root.destroy()
+            return
+
+    root.deiconify()
     app = OCRApp(root)
     root.mainloop()
 
